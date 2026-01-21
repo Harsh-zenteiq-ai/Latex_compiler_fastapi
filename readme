@@ -1,0 +1,15 @@
+## System Requirements
+
+Install LaTeX:
+```bash
+sudo apt-get update
+sudo apt-get install texlive-latex-base texlive-latex-extra texlive-fonts-recommended
+```
+
+## Python Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+uv pip install fastapi uvicorn
