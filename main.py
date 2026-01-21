@@ -1,12 +1,28 @@
 from fastapi import FastAPI, Body, Response
 from fastapi.responses import JSONResponse
 import subprocess, tempfile, os, re
+import psutil
+import time
 
 app = FastAPI()
 
-MAX_LATEX_SIZE = 5 * 1024 * 1024 #5mb
-MAX_PDF_SIZE = 20 * 1024 * 1024  #20mb
-
+MAX_LATEX_SIZE = 5 * 1024 * 1024  # 5mb
+MAX_PDF_SIZE = 20 * 1024 * 1024   # 20mb
+MAX_MEMORY_MB = 60                # 60MB
+def _proc_tree_rss_mb(proc: psutil.Process):
+    rss = 0
+    procs = [proc]
+    try:
+        procs += proc.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+    for p in procs:
+        try:
+            mi = p.memory_info()
+            rss += mi.rss
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return rss / (1024 * 1024)
 @app.post("/compile")
 async def compile_latex(code: str = Body(media_type="text/plain")):
 
@@ -27,15 +43,15 @@ async def compile_latex(code: str = Body(media_type="text/plain")):
             status_code=400,
             content={"status": "failed", "message": "invalid or trailing content after \\end{document}"}
         )
+
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             tex_path = os.path.join(temp_dir, "document.tex")
-
             with open(tex_path, "w") as f:
                 f.write(code)
 
             for _ in range(2):
-                result = subprocess.run(
+                process = subprocess.Popen(
                     [
                         "pdflatex",
                         "-no-shell-escape",
@@ -43,9 +59,36 @@ async def compile_latex(code: str = Body(media_type="text/plain")):
                         "-output-directory", temp_dir,
                         tex_path
                     ],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+                ps_process = psutil.Process(process.pid)
+
+                try:
+                    while process.poll() is None:
+                        try:
+                            rss_mb = _proc_tree_rss_mb(ps_process)
+                            if rss_mb > MAX_MEMORY_MB:
+                                process.kill()
+                                process.wait()
+                                return JSONResponse(
+                                    status_code=507,
+                                    content={"status": "failed", "message": f"Memory limit exceeded"}
+                                )
+                        except psutil.NoSuchProcess:
+                            break
+                        time.sleep(0.1)
+
+                    stdout, stderr = process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                    raise
+
+                result = subprocess.CompletedProcess(
+                    process.args, process.returncode, stdout, stderr
                 )
                 if result.returncode != 0:
                     break
@@ -66,6 +109,7 @@ async def compile_latex(code: str = Body(media_type="text/plain")):
                     media_type="application/pdf",
                     headers={"Content-Disposition": "attachment; filename=document.pdf"}
                 )
+
             log = result.stdout + "\n" + result.stderr
             errors = [
                 line for line in log.splitlines()
